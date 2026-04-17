@@ -1,0 +1,29 @@
+# Build outputs
+build/
+build-*/
+**/build/
+**/_commkit/
+
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!cmake/*.cmake
+
+# Compiled objects / binaries
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~
