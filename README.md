@@ -1,37 +1,44 @@
 # commkit
 
-轻量级 GPU 通信算子开发库，面向 ROCm/HIP（MI3xx 系 gfx942），纯 C++、0 Python。
+A lightweight GPU communication-operator development library for ROCm/HIP
+(MI3xx, gfx942). Pure C++, zero Python.
 
-设计目标：
+Design goals:
 
-- **kernel 调用尽量原始**：通信组准备好 `RankData* / Signal* / RankSignals` 后，test 直接 `<<<grid, block, 0, stream>>>` launch，不做条件判断、不做 dispatch。
-- **通信组使用尽量精简**：`CommGroup g(world_size); g.init();` 两行起步，IPC handle 交换走内置 TCP store，无需 torch / MPI。
-- **每个 kernel 一个独立子项目**：自带 `CMakeLists.txt` + `kernel.cuh` + `test.cpp`，能脱离主项目独立编译/运行。
+- **Kernel calls stay raw.** Once the comm group has prepared
+  `RankData* / Signal* / RankSignals`, the test launches the kernel directly
+  with `<<<grid, block, 0, stream>>>` — no dispatch, no conditional branching.
+- **Comm group stays minimal.** Two lines to start:
+  `CommGroup g(world_size); g.init();`. IPC handles are exchanged through a
+  built-in TCP store — no torch, no MPI.
+- **One sub-project per kernel.** Each kernel ships its own
+  `CMakeLists.txt` + `kernel.cuh` + `test.cpp` and can be built and run
+  independently of the rest of the repo.
 
-## 目录结构
+## Layout
 
 ```
 commkit/
-├── CMakeLists.txt              顶层，聚合所有 kernel
+├── CMakeLists.txt              top-level, aggregates every kernel
 ├── cmake/CommkitKernel.cmake   add_commkit_kernel() helper
-├── scripts/run.sh              起 N 个子进程，设 RANK/WORLD_SIZE/MASTER_*
+├── scripts/run.sh              spawns N children with RANK/WORLD_SIZE/MASTER_*
 ├── include/
-│   ├── opus/                   opus 数据类型 (bf16_t / vector_t 等)
+│   ├── opus/                   opus dtypes (bf16_t / vector_t / ...)
 │   └── commkit/                signal / sync / cast / tmp_buf / bench / ...
 ├── src/                        comm_group / ipc_buffer / tcp_store
 └── kernels/
-    ├── allreduce_1stage/       kernel 子项目
+    ├── allreduce_1stage/       kernel sub-project
     └── allreduce_2stage/
 ```
 
-## 依赖
+## Requirements
 
-- ROCm 7.x（路径默认 `/opt/rocm`，编译器 `amdclang++`）
+- ROCm 7.x (defaults to `/opt/rocm`, compiler `amdclang++`)
 - CMake ≥ 3.21
 
-## 编译
+## Build
 
-### 全部算子（顶层）
+### All kernels (top-level)
 
 ```bash
 cd commkit
@@ -39,11 +46,12 @@ cmake -B build
 cmake --build build -j
 ```
 
-产物：`build/kernels/<name>/test_<name>` + 同目录下的 `run.sh`。
+Outputs: `build/kernels/<name>/test_<name>` plus a `run.sh` copy next to it.
 
-### 单算子（独立编译）
+### A single kernel (standalone)
 
-每个 kernel 子目录都能独立 `cmake`，会自动 bootstrap 依赖的 `commkit_core`，且不会编译其它 kernel：
+Each kernel directory is itself a CMake project. It bootstraps
+`commkit_core` automatically and skips sibling kernels:
 
 ```bash
 cd commkit/kernels/allreduce_1stage
@@ -51,15 +59,16 @@ cmake -B build
 cmake --build build -j
 ```
 
-产物：`build/test_allreduce_1stage` + 同目录下的 `run.sh`。
+Outputs: `build/test_allreduce_1stage` plus a `run.sh` copy next to it.
 
-## 运行
+## Run
 
-`run.sh` 会在编译后自动拷贝到可执行文件旁边，直接：
+`run.sh` is copied next to every test binary at build time, so just:
 
 ```bash
-cd build/kernels/allreduce_1stage   # 或单算子的 build 目录
+cd build/kernels/allreduce_1stage   # or the standalone build dir
 ./run.sh 8 ./test_allreduce_1stage
 ```
 
-第一个参数是 rank 数。每个 rank 自己打印一行 latency / max_abs_err。
+The first argument is the world size. Each rank prints its own line with
+latency and `max_abs_err`.
