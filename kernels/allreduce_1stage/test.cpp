@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <random>
 #include <vector>
 
 #include "commkit/bench.hpp"
@@ -13,9 +14,7 @@
 using T = opus::bf16_t;
 
 // Build the bitwise-identical reference: every rank uploads its host input to
-// rank 0 via TCPStore, rank 0 sums elementwise, then broadcasts back. Every
-// rank's output should match this sum (custom_all_reduce is bitwise-identical
-// regardless of starting rank).
+// rank 0 via TCPStore, rank 0 sums elementwise, then broadcasts back.
 static std::vector<float> build_reference(commkit::CommGroup& g,
                                           const std::vector<float>& my_in_f) {
     int rank = g.rank(), W = g.world_size();
@@ -47,55 +46,118 @@ static std::vector<float> build_reference(commkit::CommGroup& g,
 
 int main() {
     constexpr int WORLD = 8;
-    constexpr int N = 1 << 20;  // 1M bf16 elements per rank
+    constexpr int M = 4;
+    constexpr int K = 7168;
+    constexpr int N = M * K;
 
     commkit::CommGroup g(WORLD);
     g.init();
 
-    // Use the pre-registered "input" relay buffer as the kernel input.
-    T* in = static_cast<T*>(g.registered_input_ptr());
+    // ---- One host-side random input shared by both modes ----
+    std::vector<T> host_in(N);
+    {
+        std::mt19937_64 rng(42 + g.rank());
+        std::uniform_real_distribution<float> dist(-1.f, 1.f);
+        for (int i = 0; i < N; ++i) host_in[i] = static_cast<T>(dist(rng));
+    }
+    std::vector<float> my_in_f(N);
+    for (int i = 0; i < N; ++i) my_in_f[i] = static_cast<float>(host_in[i]);
+    auto ref = build_reference(g, my_in_f);
+
     T* out = nullptr;
     COMMKIT_HIP_CALL(hipMalloc(&out, N * sizeof(T)));
 
-    // Fill host input, mirror to device, also keep a float copy for the ref.
-    commkit::fill_random<T>(in, N, /*seed=*/42 + g.rank());
-    std::vector<float> my_in_f;
-    commkit::copy_to_host<T>(my_in_f, in, N);
-
-    auto ref = build_reference(g, my_in_f);
-
-    // ---- Direct launch — no dispatch ----
     constexpr int pack_size = 16 / sizeof(T);
     int size_packed = N / pack_size;
     int grid = std::min(commkit::kMaxBlocks, (size_packed + 511) / 512);
 
-    auto* dp = g.rank_data(in);
-    auto launch = [&] {
+    auto check_err = [&]() {
+        std::vector<float> got;
+        commkit::copy_to_host<T>(got, out, N);
+        float e = 0.f;
+        for (int i = 0; i < N; ++i) e = std::max(e, std::fabs(got[i] - ref[i]));
+        return e;
+    };
+
+    // ---------- Eager: prev-layer output (D2D) -> IPC relay buffer -> kernel ----------
+    // The "prev_out" buffer plays the role of an upstream kernel's output. In
+    // real workloads each allreduce call needs to land its input in the
+    // registered IPC buffer first, so the D2D copy is part of the latency.
+    T* prev_out = nullptr;
+    COMMKIT_HIP_CALL(hipMalloc(&prev_out, N * sizeof(T)));
+    COMMKIT_HIP_CALL(
+        hipMemcpy(prev_out, host_in.data(), N * sizeof(T), hipMemcpyHostToDevice));
+
+    T* eager_in = static_cast<T*>(g.registered_input_ptr());
+    auto* dp_eager = g.rank_data(eager_in);
+    auto launch_eager = [&] {
+        COMMKIT_HIP_CALL(hipMemcpyAsync(eager_in, prev_out, N * sizeof(T),
+                                        hipMemcpyDeviceToDevice, g.stream()));
         commkit::kernels::launch_cross_device_reduce_1stage<T, WORLD>(
-            dp, g.rank_signals(), g.self_signal(), out,
+            dp_eager, g.rank_signals(), g.self_signal(), out,
             g.rank(), size_packed, grid, g.stream());
     };
 
-    // Correctness pass
-    launch();
+    launch_eager();
     COMMKIT_HIP_CALL(hipStreamSynchronize(g.stream()));
-
-    std::vector<float> got;
-    commkit::copy_to_host<T>(got, out, N);
-
-    float max_err = 0.f;
-    for (std::size_t i = 0; i < (std::size_t)N; ++i) {
-        max_err = std::max(max_err, std::fabs(got[i] - ref[i]));
-    }
+    float err_eager = check_err();
 
     g.barrier();
+    double lat_eager_us = commkit::bench_us(50, launch_eager, g.stream());
+    g.barrier();
 
-    // Latency
-    double lat_us = commkit::bench_us(50, launch, g.stream());
+    // ---------- Graph mode temporarily disabled ----------
+    // T* graph_in = nullptr;
+    // COMMKIT_HIP_CALL(hipMalloc(&graph_in, N * sizeof(T)));
+    // COMMKIT_HIP_CALL(
+    //     hipMemcpy(graph_in, host_in.data(), N * sizeof(T), hipMemcpyHostToDevice));
+    // g.register_input_buffer(graph_in);
+    // auto* dp_graph = g.rank_data(graph_in);
+    // auto launch_graph_kernel = [&] {
+    //     commkit::kernels::launch_cross_device_reduce_1stage<T, WORLD>(
+    //         dp_graph, g.rank_signals(), g.self_signal(), out,
+    //         g.rank(), size_packed, grid, g.stream());
+    // };
+    //
+    // auto build_graph = [&](int kernels_per_graph) {
+    //     g.begin_capture();
+    //     hipGraph_t gh = nullptr;
+    //     COMMKIT_HIP_CALL(hipStreamBeginCapture(g.stream(), hipStreamCaptureModeRelaxed));
+    //     for (int i = 0; i < kernels_per_graph; ++i) launch_graph_kernel();
+    //     COMMKIT_HIP_CALL(hipStreamEndCapture(g.stream(), &gh));
+    //     g.end_capture();
+    //     hipGraphExec_t ex = nullptr;
+    //     COMMKIT_HIP_CALL(hipGraphInstantiate(&ex, gh, nullptr, nullptr, 0));
+    //     return std::pair{gh, ex};
+    // };
+    //
+    // auto [graph, graph_exec] = build_graph(1);
+    // auto [graph10, graph10_exec] = build_graph(10);
+    //
+    // auto replay = [&] { COMMKIT_HIP_CALL(hipGraphLaunch(graph_exec, g.stream())); };
+    // auto replay10 = [&] { COMMKIT_HIP_CALL(hipGraphLaunch(graph10_exec, g.stream())); };
+    //
+    // g.barrier();
+    // double lat_graph_us = commkit::bench_us(50, replay, g.stream());
+    // g.barrier();
+    // double lat_graph10_us = commkit::bench_us(10, replay10, g.stream()) / 10.0;
+    // g.barrier();
+    // // Precision is taken from the final replay in the bench loop.
+    // COMMKIT_HIP_CALL(hipStreamSynchronize(g.stream()));
+    // float err_graph = check_err();
+    // g.barrier();
 
-    std::printf("[allreduce_1stage bf16 N=%d world=%d grid=%d rank=%d] %.2f us  max_abs_err=%.4g\n",
-                N, WORLD, grid, g.rank(), lat_us, max_err);
+    std::printf("[allreduce_1stage bf16 shape=[%d,%d] world=%d grid=%d rank=%d] "
+                "eager %.2f us (err=%.4g)\n",
+                M, K, WORLD, grid, g.rank(),
+                lat_eager_us, err_eager);
 
+    // COMMKIT_HIP_CALL(hipGraphExecDestroy(graph_exec));
+    // COMMKIT_HIP_CALL(hipGraphDestroy(graph));
+    // COMMKIT_HIP_CALL(hipGraphExecDestroy(graph10_exec));
+    // COMMKIT_HIP_CALL(hipGraphDestroy(graph10));
+    // COMMKIT_HIP_CALL(hipFree(graph_in));
+    COMMKIT_HIP_CALL(hipFree(prev_out));
     COMMKIT_HIP_CALL(hipFree(out));
     g.barrier();
     return 0;
