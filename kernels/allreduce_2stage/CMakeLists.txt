@@ -14,3 +14,23 @@ add_commkit_kernel(test_allreduce_2stage
     SOURCES test.cpp
     HEADERS kernel.cuh
 )
+
+add_commkit_kernel(test_allreduce_2stage_tp4
+    SOURCES test_tp4.cpp
+    HEADERS kernel.cuh
+)
+
+add_commkit_kernel(test_allreduce_2stage_tp4_overlap
+    SOURCES test_tp4_overlap.cpp
+    HEADERS kernel.cuh block_size_256_kernel_tp4.cuh
+)
+
+add_commkit_kernel(test_allreduce_2stage_grid16
+    SOURCES test_grid16.cpp
+    HEADERS kernel.cuh
+)
+
+add_commkit_kernel(test_allreduce_2stage_att
+    SOURCES test_att.cpp
+    HEADERS kernel.cuh
+)

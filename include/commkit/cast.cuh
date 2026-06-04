@@ -10,8 +10,8 @@ namespace commkit {
 
 // ---- scalar cast ----
 
-template <typename Src>
-COMMKIT_DINLINE opus::fp32_t upcast_s(Src val) {
+template <typename T>
+COMMKIT_DINLINE opus::fp32_t upcast_s(T val) {
     return opus::cast<opus::fp32_t>(val);
 }
 
@@ -20,9 +20,9 @@ COMMKIT_DINLINE opus::fp32_t upcast_s<opus::fp32_t>(opus::fp32_t val) {
     return val;
 }
 
-template <typename Dst>
-COMMKIT_DINLINE Dst downcast_s(opus::fp32_t val) {
-    return opus::cast<Dst>(val);
+template <typename T>
+COMMKIT_DINLINE T downcast_s(opus::fp32_t val) {
+    return opus::cast<T>(val);
 }
 
 template <>

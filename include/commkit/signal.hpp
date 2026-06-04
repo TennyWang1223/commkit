@@ -19,6 +19,11 @@ struct Signal {
     alignas(128) uint32_t start[kMaxBlocks][8];
     alignas(128) uint32_t end[kMaxBlocks][8];
     alignas(128) uint32_t _flag[kMaxBlocks];   // monotonically incrementing flag per block
+                                               //
+    alignas(128) uint32_t ss;
+    alignas(128) uint32_t arrival_cnt;
+    alignas(128) uint32_t barrier_gen;
+    alignas(128) uint32_t start_g[8];
 };
 
 // Per-rank input/output base pointer table. Indexed by peer rank.

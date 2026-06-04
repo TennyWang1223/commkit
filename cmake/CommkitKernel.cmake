@@ -25,6 +25,12 @@ function(add_commkit_kernel name)
     )
     target_link_libraries(${name} PRIVATE commkit_core)
 
+    # Emit AMDGPU assembly (.s) alongside the object file at build time.
+    # Look under CMakeFiles/<name>.dir/ for *-hip-amdgcn-amd-amdhsa-gfx*.s
+    target_compile_options(${name} PRIVATE
+        $<$<COMPILE_LANGUAGE:HIP>:--save-temps=obj>
+    )
+
     # Drop run.sh next to the binary so users can `./run.sh 8 ./test_xxx`
     # without hunting for the script.
     add_custom_command(TARGET ${name} POST_BUILD
