@@ -24,12 +24,14 @@ set(COMMKIT_ROOT ${CMAKE_CURRENT_SOURCE_DIR} CACHE PATH "commkit root")
 
 add_library(commkit_core STATIC
     src/comm_group.cpp
-    src/ipc_buffer.cpp
+    src/peer_mem/peer_mem_ipc.cpp
+    src/peer_mem/factory.cpp
     src/tcp_store.cpp
 )
 set_source_files_properties(
     src/comm_group.cpp
-    src/ipc_buffer.cpp
+    src/peer_mem/peer_mem_ipc.cpp
+    src/peer_mem/factory.cpp
     src/tcp_store.cpp
     PROPERTIES LANGUAGE HIP
 )

@@ -13,7 +13,7 @@
 namespace commkit {
 
 class TCPStore;
-class IPCBufferPool;
+class PeerMemPool;
 
 // Lightweight communication group for a single tensor-parallel slice.
 //
@@ -96,16 +96,9 @@ class CommGroup {
     std::vector<void*> graph_unreg_outputs_;
 
     std::unique_ptr<TCPStore> store_;
-    std::unique_ptr<IPCBufferPool> pool_;
+    std::unique_ptr<PeerMemPool> pool_;
 
-    void register_input_with_handles_(
-        void* self,
-        const std::vector<std::vector<uint8_t>>& handles,
-        const std::vector<int64_t>& offsets);
-    void register_output_with_handles_(
-        void* self,
-        const std::vector<std::vector<uint8_t>>& handles,
-        const std::vector<int64_t>& offsets);
+    RankData* register_peers_(std::unordered_map<void*, RankData*>& table, void* self);
     void check_rank_data_capacity_(std::size_t n);
     void flush_graph_buffers_();
 };

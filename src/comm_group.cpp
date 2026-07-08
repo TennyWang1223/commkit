@@ -1,6 +1,6 @@
 #include "commkit/comm_group.hpp"
 #include "commkit/hip_check.hpp"
-#include "commkit/ipc_buffer.hpp"
+#include "commkit/peer_mem.hpp"
 #include "commkit/tcp_store.hpp"
 
 #include <cstdio>
@@ -36,7 +36,6 @@ CommGroup::~CommGroup() {
         rank_data_buf_ = nullptr;
     }
     pool_.reset();
-    clear_ipc_handle_cache();
     if (stream_) {
         (void)hipStreamDestroy(stream_);
         stream_ = nullptr;
@@ -67,13 +66,13 @@ void CommGroup::init() {
     store_->barrier();
 
     // 4. allocate buffers via pool
-    pool_ = std::make_unique<IPCBufferPool>(rank_, world_size_, store_.get());
+    pool_ = make_peer_mem_pool(rank_, world_size_, store_.get());
     // meta layout: [Signal | scratch (2 * max_size)]; scratch sized to fit
     // 2-stage reduce-scatter + extra write-mode slot.
-    pool_->create("meta", sizeof(Signal) + max_size_ * 2, /*uncached=*/true);
-    pool_->create("input", max_size_, /*uncached=*/false);
+    pool_->alloc("meta", sizeof(Signal) + max_size_ * 2, /*uncached=*/true);
+    pool_->alloc("input", max_size_, /*uncached=*/false);
 
-    self_sg_ = static_cast<Signal*>(pool_->at("meta").data());
+    self_sg_ = static_cast<Signal*>(pool_->at("meta"));
 
     // 5. RankData host-side pool (small device buffer holding ngpus*ptrs entries).
     // Sized for ~131k registrations like aiter.
@@ -82,20 +81,14 @@ void CommGroup::init() {
     rank_data_base_ = reinterpret_cast<RankData*>(rank_data_buf_);
     rank_data_end_ = rank_data_base_ + rank_data_capacity_ / sizeof(RankData);
 
-    // 6. exchange meta IPC handles, fill RankSignals
-    auto [meta_handles, meta_offsets] = pool_->get_ipc_meta("meta");
+    // 6. exchange meta handles, fill RankSignals
+    auto meta_peers = pool_->exchange(self_sg_);
     for (int i = 0; i < world_size_; ++i) {
-        if (i == rank_) {
-            sg_.signals[i] = self_sg_;
-        } else {
-            char* base = static_cast<char*>(open_ipc_handle(meta_handles[i].data()));
-            sg_.signals[i] = reinterpret_cast<Signal*>(base + meta_offsets[i]);
-        }
+        sg_.signals[i] = static_cast<Signal*>(meta_peers[i]);
     }
 
     // 7. register the pre-allocated "input" relay buffer
-    auto [in_handles, in_offsets] = pool_->get_ipc_meta("input");
-    register_input_with_handles_(pool_->at("input").data(), in_handles, in_offsets);
+    register_peers_(input_buffers_, pool_->at("input"));
 
     store_->barrier();
     initialized_ = true;
@@ -108,53 +101,22 @@ void CommGroup::check_rank_data_capacity_(std::size_t n) {
     }
 }
 
-void CommGroup::register_input_with_handles_(
-    void* self,
-    const std::vector<std::vector<uint8_t>>& handles,
-    const std::vector<int64_t>& offsets) {
+RankData* CommGroup::register_peers_(std::unordered_map<void*, RankData*>& table, void* self) {
     check_rank_data_capacity_(1);
+    auto peers = pool_->exchange(self);
     RankData host_rd{};
     for (int i = 0; i < world_size_; ++i) {
-        if (i == rank_) {
-            host_rd.ptrs[i] = self;
-        } else {
-            char* base = static_cast<char*>(open_ipc_handle(handles[i].data()));
-            host_rd.ptrs[i] = base + offsets[i];
-        }
+        host_rd.ptrs[i] = peers[i];
     }
     RankData* dev = rank_data_base_++;
     COMMKIT_HIP_CALL(hipMemcpy(dev, &host_rd, sizeof(RankData), hipMemcpyHostToDevice));
-    input_buffers_[self] = dev;
+    table[self] = dev;
+    return dev;
 }
 
-void CommGroup::register_output_with_handles_(
-    void* self,
-    const std::vector<std::vector<uint8_t>>& handles,
-    const std::vector<int64_t>& offsets) {
-    check_rank_data_capacity_(1);
-    RankData host_rd{};
-    for (int i = 0; i < world_size_; ++i) {
-        if (i == rank_) {
-            host_rd.ptrs[i] = self;
-        } else {
-            char* base = static_cast<char*>(open_ipc_handle(handles[i].data()));
-            host_rd.ptrs[i] = base + offsets[i];
-        }
-    }
-    RankData* dev = rank_data_base_++;
-    COMMKIT_HIP_CALL(hipMemcpy(dev, &host_rd, sizeof(RankData), hipMemcpyHostToDevice));
-    output_buffers_[self] = dev;
-}
+void CommGroup::register_input_buffer(void* ptr) { register_peers_(input_buffers_, ptr); }
 
-void CommGroup::register_input_buffer(void* ptr) {
-    auto [h, o] = pool_->get_external_ipc_meta(ptr);
-    register_input_with_handles_(ptr, h, o);
-}
-
-void CommGroup::register_output_buffer(void* ptr) {
-    auto [h, o] = pool_->get_external_ipc_meta(ptr);
-    register_output_with_handles_(ptr, h, o);
-}
+void CommGroup::register_output_buffer(void* ptr) { register_peers_(output_buffers_, ptr); }
 
 RankData* CommGroup::rank_data(void* input) {
     auto it = input_buffers_.find(input);
@@ -189,8 +151,8 @@ RankData* CommGroup::output_rank_data(void* output) {
     std::abort();
 }
 
-void* CommGroup::registered_input_ptr() const { return pool_->at("input").data(); }
-std::size_t CommGroup::registered_input_size() const { return pool_->at("input").size(); }
+void* CommGroup::registered_input_ptr() const { return pool_->at("input"); }
+std::size_t CommGroup::registered_input_size() const { return pool_->size_of("input"); }
 
 void CommGroup::begin_capture() { capturing_ = true; }
 
@@ -211,25 +173,15 @@ void CommGroup::flush_graph_buffers_() {
     // graph capture is rare and small batches dominate in practice.
     std::vector<RankData> rds(total);
     for (std::size_t i = 0; i < num_in; ++i) {
-        auto [h, o] = pool_->get_external_ipc_meta(graph_unreg_inputs_[i]);
+        auto peers = pool_->exchange(graph_unreg_inputs_[i]);
         for (int j = 0; j < world_size_; ++j) {
-            if (j == rank_) {
-                rds[i].ptrs[j] = graph_unreg_inputs_[i];
-            } else {
-                char* base = static_cast<char*>(open_ipc_handle(h[j].data()));
-                rds[i].ptrs[j] = base + o[j];
-            }
+            rds[i].ptrs[j] = peers[j];
         }
     }
     for (std::size_t i = 0; i < num_out; ++i) {
-        auto [h, o] = pool_->get_external_ipc_meta(graph_unreg_outputs_[i]);
+        auto peers = pool_->exchange(graph_unreg_outputs_[i]);
         for (int j = 0; j < world_size_; ++j) {
-            if (j == rank_) {
-                rds[num_in + i].ptrs[j] = graph_unreg_outputs_[i];
-            } else {
-                char* base = static_cast<char*>(open_ipc_handle(h[j].data()));
-                rds[num_in + i].ptrs[j] = base + o[j];
-            }
+            rds[num_in + i].ptrs[j] = peers[j];
         }
         output_buffers_[graph_unreg_outputs_[i]] = rank_data_base_ + num_in + i;
     }
