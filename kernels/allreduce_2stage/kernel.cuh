@@ -15,6 +15,195 @@ namespace commkit::kernels {
 constexpr int kThreadNum2Stage = 512;
 #define THREAD_NUM 512
 
+template <typename T>
+__global__ void __launch_bounds__(512, 1) car_wt_llproto(
+    RankData* _input_dp, RankData* _output_dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size
+    )
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    constexpr int ngpus     = 4;
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    int index  = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    const P* ptrs[ngpus];
+    P* tmps[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; i++)
+    {
+        int target = (rank + i) % ngpus;
+        ptrs[i]    = (const P*)_input_dp->ptrs[target];
+        tmps[i]    = get_tmp_buf<P>(sg.signals[target]);
+    }
+    auto tmp_out = tmps[0];
+
+    /*
+     * signal 应该是tmp尾部的buffer，且按照128b隔开
+     * 比如block[0]的signal是tmp[signal_start]
+     * block[1]的signal就是reinterpret_cast<int*>(&tmp[signal_start]) + 32
+     * 向3rank写数据就要对3rank的flag做atomic_add(1)
+     * 下面是伪代码
+    for (int idx = index; idx < size; idx += stride)
+    {
+      // cross device store
+      P local_inp = ptrs[0][idx];
+      global_store_nt(tmps[1][rank * size + idx], local_inp);
+      global_store_nt(tmps[2][rank * size + idx], local_inp);
+      global_store_nt(tmps[3][rank * size + idx], local_inp);
+      // systemfence
+      s_waitcnt vmcnt(0) lgkmcnt(0);
+      buffer_wbinv sc0 sc1;
+      if (threadIdx.x < 3)
+      {
+        // cross device store flag
+        atomic_add(reinterpret_cast<int*>(&tmps[threadIdx.x + 1][size * 4]) + gridDim.x * 32 * rank + blockIdx.x * 32, 1);
+        // load local flag
+        int local_flag;
+        if (slow_path)
+        {
+          local_flag = atomic_add(reinterpret_cast<int*>(&tmp_out[size * 4]) + gridDim.x * 32 * rank + blockIdx.x * 32, 0);
+        }
+        else
+        {
+          // bypass cache, call compiler dont optimize loop load
+          local_flag = global_load_nt(reinterpret_cast<int*>(&tmp_out[size * 4]) + gridDim.x * 32 * rank + blockIdx.x * 32);
+          s_waitcnt vmcnt(0);
+          buffer_inv sc0 sc1;
+        }
+        while (local_flag != 1)
+        {
+          sleep;
+          local_flag = global_load_nt(reinterpret_cast<int*>(&tmp_out[size * 4]) + gridDim.x * 32 * rank + blockIdx.x * 32);
+          s_waitcnt vmcnt(0);
+          buffer_inv sc0 sc1;
+        }
+      }
+      __syncthreads();
+      P remote_data1 = tmp_out[size * (rank + 1) % 4 + idx];
+      P remote_data2 = tmp_out[size * (rank + 2) % 4 + idx];
+      P remote_data3 = tmp_out[size * (rank + 3) % 4 + idx];
+      P rslt = local_inp + remote_data1 + remote_data2 + remote_data3;
+      output[idx] = rslt;
+    }
+    */
+
+    // ======================= asm volatile 实现 ===============================
+    // Cross-call barrier: stops this call's stage-1 cross-device stores from
+    // clobbering a slow peer's stage-3 reads of the *previous* call (the LL flag
+    // only orders producer/consumer within a single call).
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    // LL flags live in the tail of the tmp buffer (right after the ngpus data
+    // slots), 32 ints (128 B) apart per (source_rank, block). Each peer does
+    // atomic_add(1) on its slot once per call, so the slot equals this kernel's
+    // own call count. ll_epoch is a private per-block counter (NOT the shared
+    // _flag, which other kernels in the process also bump) so the expected value
+    // stays in lockstep with the accumulation.
+    uint32_t flag_val = self_sg->ll_epoch[blockIdx.x] + 1;
+
+    // Native 4x32b vector so it lands in a contiguous VGPR tuple; HIP's int4 is
+    // an aggregate and gets passed indirectly, which inline asm rejects for "v".
+    using v4i = int __attribute__((ext_vector_type(4)));
+
+    // ---- stage 1: replicate my input into slot `rank` of every peer's tmp ----
+    for(int idx = index; idx < size; idx += stride)
+    {
+        P local_inp = ptrs[0][idx];
+        v4i dvec    = *reinterpret_cast<v4i*>(&local_inp);
+#pragma unroll
+        for(int i = 1; i < ngpus; ++i)
+        {
+            // write-through: `nt` bypasses L2 so the store goes straight to peer
+            // memory (no need to wb the whole L2 afterwards for this line).
+            P* dst = &tmps[i][rank * size + idx];
+            asm volatile("global_store_dwordx4 %0, %1, off nt\n\t" ::"v"(dst), "v"(dvec)
+                         : "memory");
+        }
+    }
+
+    // ---- system fence: flush my cross-device stores to peer memory ----
+    asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)\n\t"
+                 "buffer_wbl2 sc0 sc1\n\t"
+                 "s_waitcnt vmcnt(0)\n\t" ::: "memory");
+
+    // ---- stage 2: signal the 3 peers, then wait on the 3 sources ----
+    // thread t handles peer (rank+t+1): atomic_add(1) my flag into its tmp tail,
+    // then spin-load my own tmp tail slot for source (rank+t+1) until it arrives.
+    if(threadIdx.x < ngpus - 1)
+    {
+        // cross device store flag: atomicAdd(peer_slot, 1). System scope
+        // (sc0 sc1) so the increment is written through to the consumer GPU; the
+        // no-return form rejects sc0, so use the return form and drop the result.
+        uint32_t* fdst = reinterpret_cast<uint32_t*>(&tmps[threadIdx.x + 1][size * ngpus])
+                         + gridDim.x * 32 * rank + blockIdx.x * 32;
+        uint32_t prev;
+        asm volatile("global_atomic_add %0, %1, %2, off sc0 sc1\n\t"
+                     : "=v"(prev)
+                     : "v"(fdst), "v"(1u)
+                     : "memory");
+
+        int src_rank   = (rank + threadIdx.x + 1) % ngpus;
+        uint32_t* fsrc = reinterpret_cast<uint32_t*>(&tmp_out[size * ngpus])
+                         + gridDim.x * 32 * src_rank + blockIdx.x * 32;
+
+        // bypass cache via `nt`, buffer_inv each iter; "memory" stops the compiler
+        // from hoisting the load out of the loop.
+        uint32_t observed;
+        asm volatile("global_load_dword %0, %1, off sc1 nt\n\t"
+                     "s_waitcnt vmcnt(0)\n\t"
+                     "buffer_inv sc1\n\t"
+                     : "=v"(observed)
+                     : "v"(fsrc)
+                     : "memory");
+        while(observed < flag_val)
+        {
+            asm volatile("s_sleep 1\n\t"
+                         "global_load_dword %0, %1, off sc1 nt\n\t"
+                         "s_waitcnt vmcnt(0)\n\t"
+                         "buffer_inv sc1\n\t"
+                         : "=v"(observed)
+                         : "v"(fsrc)
+                         : "memory");
+        }
+    }
+    __syncthreads();
+
+    // ---- stage 3: local reduce of all ngpus slots, write allreduce result ----
+    for(int idx = index; idx < size; idx += stride)
+    {
+        P local_inp = ptrs[0][idx];
+        A acc;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+        {
+            acc[j] = upcast_s(local_inp[j]);
+        }
+#pragma unroll
+        for(int i = 1; i < ngpus; ++i)
+        {
+            int slot = (rank + i) % ngpus;
+            P remote = tmp_out[size * slot + idx];
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+            {
+                acc[j] += upcast_s(remote[j]);
+            }
+        }
+        P rslt;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+        {
+            rslt[j] = downcast_s<T>(acc[j]);
+        }
+        reinterpret_cast<P*>(result)[idx] = rslt;
+    }
+
+    if(threadIdx.x == 0)
+    {
+        self_sg->ll_epoch[blockIdx.x] = flag_val;
+    }
+}
+
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _input_dp,
                                                                      RankData* _output_dp,
@@ -141,7 +330,12 @@ __global__ void __launch_bounds__(512, 1) ar_naive_overlap(RankData* _input_dp,
 
     for (int i = 0; i < loop_time; ++i)
     {
-      const P* gptr = &ptrs[warp_id][start + tid + stride * (i + 1)];
+      // Last iteration's prefetch (i+1 == loop_time) is a dead read never
+      // consumed; clamp it to the final valid element so it can't run past the
+      // input allocation (VMM/dmabuf maps to the exact buffer bound, unlike IPC
+      // which mapped the whole underlying allocation and hid this over-read).
+      int pf = (i + 1 < loop_time) ? (i + 1) : (loop_time - 1);
+      const P* gptr = &ptrs[warp_id][start + tid + stride * pf];
       int4 remote_data_reg;
       asm volatile("flat_load_dwordx4 %0, %1"
                    : "=v"(remote_data_reg)
@@ -266,8 +460,13 @@ __global__ void __launch_bounds__(256, 1) ar_4wave_overlap(RankData* _input_dp,
 
     for (int i = 0; i < loop_time; ++i)
     {
-      const P* gptr0 = &ptrs[warp_id][start + tid + stride * (i + 1)];
-      const P* gptr1 = &ptrs[warp_id + 4][start + tid + stride * (i + 1)];
+      // Last iteration's prefetch (i+1 == loop_time) is a dead read never
+      // consumed; clamp it to the final valid element so it can't run past the
+      // input allocation (VMM/dmabuf maps to the exact buffer bound, unlike IPC
+      // which mapped the whole underlying allocation and hid this over-read).
+      int pf = (i + 1 < loop_time) ? (i + 1) : (loop_time - 1);
+      const P* gptr0 = &ptrs[warp_id][start + tid + stride * pf];
+      const P* gptr1 = &ptrs[warp_id + 4][start + tid + stride * pf];
       int4 remote_data_reg0;
       int4 remote_data_reg1;
       asm volatile("flat_load_dwordx4 %0, %2\n\t"
@@ -1423,6 +1622,20 @@ inline void launch_car_db_tp4(RankData* in_dp,
                               hipStream_t stream) {
     car_db_tp4<T><<<grid, kThreadNumCarDbTp4, 0, stream>>>(
         in_dp, sg, self_sg, result, rank, size_packed);
+}
+
+template <typename T>
+inline void launch_car_wt_llproto(RankData* in_dp,
+                                  RankSignals sg,
+                                  Signal* self_sg,
+                                  T* result,
+                                  int rank,
+                                  int size_packed,
+                                  int grid,
+                                  hipStream_t stream,
+                                  RankData* out_dp = nullptr) {
+    car_wt_llproto<T><<<grid, kThreadNum2Stage, 0, stream>>>(
+        in_dp, out_dp, sg, self_sg, result, rank, size_packed);
 }
 
 template <typename T>
