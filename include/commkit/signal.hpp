@@ -24,6 +24,8 @@ struct Signal {
     alignas(128) uint32_t arrival_cnt;
     alignas(128) uint32_t barrier_gen;
     alignas(128) uint32_t start_g[8];
+    alignas(128) uint32_t ll_epoch[kMaxBlocks];  // per-block call counter for the LL-proto kernel
+
 };
 
 // Per-rank input/output base pointer table. Indexed by peer rank.

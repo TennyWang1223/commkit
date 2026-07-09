@@ -26,10 +26,16 @@ commkit/
 │   ├── opus/                   opus dtypes (bf16_t / vector_t / ...)
 │   └── commkit/                signal / sync / cast / tmp_buf / bench / ...
 ├── src/                        comm_group / ipc_buffer / tcp_store
-└── kernels/
-    ├── allreduce_1stage/       kernel sub-project
-    └── allreduce_2stage/
+└── kernels/                    grouped by GPU arch: kernels/<arch>/<kernel>/
+    ├── gfx9/                   MI300/MI308/MI355 implementations
+    │   ├── allreduce_1stage/   kernel sub-project
+    │   └── allreduce_2stage/
+    └── gfx12/                  MI455 implementations
 ```
+
+Kernels live under an arch directory because the implementation differs per
+GPU arch. The cross-card memory backend (VMM) is shared, but the kernels
+themselves are not — build the arch that matches your host.
 
 ## Requirements
 
@@ -54,7 +60,7 @@ Each kernel directory is itself a CMake project. It bootstraps
 `commkit_core` automatically and skips sibling kernels:
 
 ```bash
-cd commkit/kernels/allreduce_1stage
+cd commkit/kernels/gfx9/allreduce_1stage
 cmake -B build
 cmake --build build -j
 ```
@@ -66,7 +72,7 @@ Outputs: `build/test_allreduce_1stage` plus a `run.sh` copy next to it.
 `run.sh` is copied next to every test binary at build time, so just:
 
 ```bash
-cd build/kernels/allreduce_1stage   # or the standalone build dir
+cd build/kernels/gfx9/allreduce_1stage   # or the standalone build dir
 ./run.sh 8 ./test_allreduce_1stage
 ```
 

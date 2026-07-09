@@ -11,13 +11,13 @@ class TCPStore;
 
 // Backend-agnostic pool of peer-visible device memory.
 //
-// This is the one seam that differs across GPU architectures:
-//   - gfx9  (MI300/MI308/MI355): hipIpc* handles broadcast through TCPStore.
-//   - gfx12 (MI455): VMM (hipMemCreate/Map) with fd handles passed via a unix
-//     socket, because IPC is broken on gfx1250.
+// Cross-card sharing is handled by a single VMM backend (hipMemCreate/Map with
+// fd handles passed over a unix socket) that works on gfx9 and gfx12 alike, so
+// this layer is not an arch seam. Architecture differences live in the kernel
+// implementations (see kernels/), not here.
 //
-// Everything above this interface (CommGroup, kernels) is arch-neutral: it only
-// ever sees plain device pointers, already mapped into the local address space.
+// This interface only ever exposes plain device pointers, already mapped into
+// the local address space.
 class PeerMemPool {
  public:
     virtual ~PeerMemPool() = default;
@@ -36,8 +36,8 @@ class PeerMemPool {
     virtual std::vector<void*> exchange(void* local_ptr) = 0;
 };
 
-// Runtime backend selection by device arch (gcnArchName). Called once by
-// CommGroup after hipSetDevice.
+// Constructs the single VMM-based backend. Called once by CommGroup after
+// hipSetDevice.
 std::unique_ptr<PeerMemPool> make_peer_mem_pool(int rank, int world_size, TCPStore* store);
 
 }  // namespace commkit

@@ -183,6 +183,58 @@ int main() {
                 M, K, WORLD, grid_db, g.rank(),
                 lat_db_eager_us, err_db_eager, lat_db_graph_us, err_db_graph);
 
+    // ============ car_wt_llproto (4-rank LL write-through, 512 threads) ============
+    // Each thread strides over the FULL size_packed (no per-rank split), so size
+    // the grid for the whole array, not per_rank. Cap at kMaxBlocks (flag fan-out
+    // in the tmp tail is sized for <= kMaxBlocks).
+    int grid_ll = std::min(commkit::kMaxBlocks, (size_packed + 511) / 512);
+
+    auto launch_ll_eager = [&] {
+        COMMKIT_HIP_CALL(hipMemcpyAsync(eager_in, prev_out, N * sizeof(T),
+                                        hipMemcpyDeviceToDevice, g.stream()));
+        commkit::kernels::launch_car_wt_llproto<T>(
+            dp_eager, g.rank_signals(), g.self_signal(), out,
+            g.rank(), size_packed, grid_ll, g.stream());
+    };
+
+    launch_ll_eager();
+    COMMKIT_HIP_CALL(hipStreamSynchronize(g.stream()));
+    float err_ll_eager = check_err();
+
+    g.barrier();
+    double lat_ll_eager_us = commkit::bench_us(50, launch_ll_eager, g.stream());
+    g.barrier();
+
+    auto launch_ll_graph_kernel = [&] {
+        commkit::kernels::launch_car_wt_llproto<T>(
+            dp_graph, g.rank_signals(), g.self_signal(), out,
+            g.rank(), size_packed, grid_ll, g.stream());
+    };
+
+    g.begin_capture();
+    hipGraph_t graph_ll = nullptr;
+    COMMKIT_HIP_CALL(hipStreamBeginCapture(g.stream(), hipStreamCaptureModeRelaxed));
+    launch_ll_graph_kernel();
+    COMMKIT_HIP_CALL(hipStreamEndCapture(g.stream(), &graph_ll));
+    g.end_capture();
+
+    hipGraphExec_t graph_ll_exec = nullptr;
+    COMMKIT_HIP_CALL(hipGraphInstantiate(&graph_ll_exec, graph_ll, nullptr, nullptr, 0));
+
+    auto replay_ll = [&] { COMMKIT_HIP_CALL(hipGraphLaunch(graph_ll_exec, g.stream())); };
+    g.barrier();
+    double lat_ll_graph_us = commkit::bench_us(50, replay_ll, g.stream());
+    COMMKIT_HIP_CALL(hipStreamSynchronize(g.stream()));
+    float err_ll_graph = check_err();
+    g.barrier();
+
+    std::printf("[car_wt_llproto bf16 shape=[%d,%d] world=%d grid=%d rank=%d] "
+                "eager %.2f us (err=%.4g)  graph %.2f us (err=%.4g)\n",
+                M, K, WORLD, grid_ll, g.rank(),
+                lat_ll_eager_us, err_ll_eager, lat_ll_graph_us, err_ll_graph);
+
+    COMMKIT_HIP_CALL(hipGraphExecDestroy(graph_ll_exec));
+    COMMKIT_HIP_CALL(hipGraphDestroy(graph_ll));
     COMMKIT_HIP_CALL(hipGraphExecDestroy(graph_db_exec));
     COMMKIT_HIP_CALL(hipGraphDestroy(graph_db));
     COMMKIT_HIP_CALL(hipGraphExecDestroy(graph_exec));

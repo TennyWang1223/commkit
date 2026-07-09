@@ -21,6 +21,9 @@ Makefile
 *.dll
 *.exe
 
+# Internal-only notes (arch spec digests — do not upload)
+NOTES_*.md
+
 # Editor / OS
 .vscode/
 .idea/

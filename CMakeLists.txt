@@ -45,15 +45,17 @@ target_compile_options(commkit_core PRIVATE
 
 include(${COMMKIT_ROOT}/cmake/CommkitKernel.cmake)
 
-# Aggregate kernel sub-projects.
-# - When the top-level CMakeLists is the entry point, walk every kernel dir.
-# - When a kernel sub-project bootstrapped us (COMMKIT_ONLY_KERNEL set), only
-#   add that one — siblings stay out of the build.
+# Aggregate kernel sub-projects. Kernels are grouped by GPU arch, so the tree is
+# kernels/<arch>/<kernel>/ (e.g. kernels/gfx9/allreduce_2stage). Implementations
+# differ per arch; only the arch matching the build host is expected to compile.
+# - When the top-level CMakeLists is the entry point, walk every arch/kernel dir.
+# - When a kernel sub-project bootstrapped us (COMMKIT_ONLY_KERNEL set, holds the
+#   arch-relative path e.g. "gfx9/allreduce_2stage"), only add that one.
 if(DEFINED COMMKIT_ONLY_KERNEL)
     add_subdirectory(${COMMKIT_ROOT}/kernels/${COMMKIT_ONLY_KERNEL}
                      ${CMAKE_CURRENT_BINARY_DIR}/_kernel_${COMMKIT_ONLY_KERNEL})
 else()
-    file(GLOB kernel_dirs RELATIVE ${COMMKIT_ROOT}/kernels ${COMMKIT_ROOT}/kernels/*)
+    file(GLOB kernel_dirs RELATIVE ${COMMKIT_ROOT}/kernels ${COMMKIT_ROOT}/kernels/*/*)
     foreach(kd ${kernel_dirs})
         if(IS_DIRECTORY ${COMMKIT_ROOT}/kernels/${kd}
            AND EXISTS ${COMMKIT_ROOT}/kernels/${kd}/CMakeLists.txt)

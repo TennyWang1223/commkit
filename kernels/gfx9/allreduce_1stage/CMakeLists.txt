@@ -4,8 +4,8 @@ cmake_minimum_required(VERSION 3.21)
 # fall through to the top-level CMakeLists, which will then loop back here.
 if(NOT TARGET commkit_core)
     project(allreduce_1stage_standalone LANGUAGES CXX HIP)
-    set(COMMKIT_ONLY_KERNEL allreduce_1stage CACHE STRING "" FORCE)
-    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../..
+    set(COMMKIT_ONLY_KERNEL gfx9/allreduce_1stage CACHE STRING "" FORCE)
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../..
                      ${CMAKE_CURRENT_BINARY_DIR}/_commkit)
     return()
 endif()
