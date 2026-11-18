@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "commkit"
+version = "0.2.0"
+description = "Communication kernels for AMD GPUs, one kernel per name (HIP + JIT + torch)"
+requires-python = ">=3.10"
+dependencies = ["torch", "pybind11", "ninja"]
+
+[tool.setuptools.packages.find]
+include = ["commkit*"]
+
+[tool.pytest.ini_options]
+pythonpath = [".", "tests"]
+testpaths = ["tests"]
